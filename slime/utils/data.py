@@ -144,30 +144,49 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
     Timer().seq_lens = total_lengths
 
     if args.balance_data:
-        # Group-aware partitioning to keep each group together
-        n_samples_per_prompt = getattr(args, "n_samples_per_prompt", 1)
-        # Calculate group-level lengths (sum of lengths for each group)
-        num_groups = len(total_lengths) // n_samples_per_prompt
-        group_lengths = []
-        for i in range(num_groups):
-            start_idx = i * n_samples_per_prompt
-            end_idx = start_idx + n_samples_per_prompt
-            group_total_length = sum(total_lengths[start_idx:end_idx])
-            group_lengths.append(group_total_length)
+        group_sizes = data.get("group_sizes")
+        if group_sizes:
+            # Group-aware partitioning with variable group sizes
+            group_lengths = []
+            current_pos = 0
+            for size in group_sizes:
+                group_total_length = sum(total_lengths[current_pos : current_pos + size])
+                group_lengths.append(group_total_length)
+                current_pos += 1
+        else:
+            # Fallback to the old logic for fixed group sizes
+            n_samples_per_prompt = getattr(args, "n_samples_per_prompt", 1)
+            num_groups = len(total_lengths) // n_samples_per_prompt
+            group_lengths = []
+            for i in range(num_groups):
+                start_idx = i * n_samples_per_prompt
+                end_idx = start_idx + n_samples_per_prompt
+                group_total_length = sum(total_lengths[start_idx:end_idx])
+                group_lengths.append(group_total_length)
 
         # Get partitions at group level
         group_partitions = get_seqlen_balanced_partitions(group_lengths, dp_size, equal_size=True)
 
         # Expand group partitions to trajectory level
         parititions = []
-        for dp_rank_groups in group_partitions:
-            trajectory_indices = []
-            for group_idx in dp_rank_groups:
-                # Add all trajectories in this group
-                start_idx = group_idx * n_samples_per_prompt
-                end_idx = start_idx + n_samples_per_prompt
-                trajectory_indices.extend(range(start_idx, end_idx))
-            parititions.append(trajectory_indices)
+        if group_sizes:
+            group_start_indices = [0] + list(np.cumsum(group_sizes)[:-1])
+            for dp_rank_groups in group_partitions:
+                trajectory_indices = []
+                for group_idx in dp_rank_groups:
+                    start_idx = group_start_indices[group_idx]
+                    end_idx = start_idx + group_sizes[group_idx]
+                    trajectory_indices.extend(range(start_idx, end_idx))
+                parititions.append(trajectory_indices)
+        else:
+            n_samples_per_prompt = getattr(args, "n_samples_per_prompt", 1)
+            for dp_rank_groups in group_partitions:
+                trajectory_indices = []
+                for group_idx in dp_rank_groups:
+                    start_idx = group_idx * n_samples_per_prompt
+                    end_idx = start_idx + n_samples_per_prompt
+                    trajectory_indices.extend(range(start_idx, end_idx))
+                parititions.append(trajectory_indices)
 
     def get_partition(val):
         if args.balance_data:

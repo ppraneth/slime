@@ -4,13 +4,13 @@ import random
 import threading
 import time
 from pathlib import Path
-from typing import List, Union
+from typing import List, Optional, Union
 
 import ray
 import torch
+import wandb
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-import wandb
 from slime.backends.sglang_utils.sglang_engine import SGLangEngine
 from slime.ray.rollout_data_source import RolloutDataSourceWithBuffer
 from slime.utils.http_utils import find_available_port, get_host_info, init_http_client
@@ -75,10 +75,10 @@ class RolloutManager:
         monitor_started = self._start_health_monitor()
         start_time = time.time()
         try:
-            data = self._get_rollout_data()
+            data, group_sizes = self._get_rollout_data()
             self._save_debug_rollout_data(data)
             _log_rollout_data(rollout_id, self.args, data, time.time() - start_time)
-            data = self._convert_samples_to_train_data(data)
+            data = self._convert_samples_to_train_data(data, group_sizes)
             return Box(ray.put(data))
         finally:
             if monitor_started:
@@ -178,16 +178,12 @@ class RolloutManager:
             data = [Sample.from_dict(sample) for sample in data]
         else:
             data = self.generate_rollout(self.args, self.rollout_id, self.data_source, evaluation=False)
-            # flatten the data if it is a list of lists
-            while isinstance(data[0], list):
+            group_sizes = None
+            if data and isinstance(data[0], list):
+                group_sizes = [len(group) for group in data]
                 data = sum(data, [])
 
-            if len(data) % self.args.global_batch_size != 0:
-                trim_len = (len(data) // self.args.global_batch_size) * self.args.global_batch_size
-                origin_data_length = len(data)
-                data = data[:trim_len]
-                print(f"trim number of samples from {origin_data_length} to {trim_len}")
-        return data
+        return data, group_sizes
 
     def _save_debug_rollout_data(self, data):
         # TODO to be refactored (originally Buffer._set_data)
@@ -203,7 +199,9 @@ class RolloutManager:
                 path,
             )
 
-    def _post_process_rewards(self, samples: Union[list[Sample], list[list[Sample]]]):
+    def _post_process_rewards(
+        self, samples: Union[list[Sample], list[list[Sample]]], group_sizes: Optional[list[int]] = None
+    ):
         if self.custom_reward_post_process_func is not None:
             return self.custom_reward_post_process_func(self.args, samples)
 
@@ -212,25 +210,39 @@ class RolloutManager:
             self.args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
             and self.args.rewards_normalization
         ):
-            # group norm
             rewards = torch.tensor(raw_rewards, dtype=torch.float)
-            if rewards.shape[-1] == self.args.n_samples_per_prompt * self.args.rollout_batch_size:
-                rewards = rewards.reshape(-1, self.args.n_samples_per_prompt)
+            if group_sizes:
+                # Split rewards into groups and normalize
+                grouped_rewards = torch.split(rewards, group_sizes)
+                normalized_rewards = []
+                for group in grouped_rewards:
+                    mean = group.mean()
+                    std = group.std()
+                    if self.args.advantage_estimator in ["grpo", "gspo"] and self.args.grpo_std_normalization:
+                        group = (group - mean) / (std + 1e-6)
+                    else:
+                        group = group - mean
+                    normalized_rewards.append(group)
+                rewards = torch.cat(normalized_rewards)
             else:
-                # when samples count are not equal in each group
-                rewards = rewards.view(-1, rewards.shape[-1])
-            mean = rewards.mean(dim=-1, keepdim=True)
-            rewards = rewards - mean
-
-            if self.args.advantage_estimator in ["grpo", "gspo"] and self.args.grpo_std_normalization:
-                std = rewards.std(dim=-1, keepdim=True)
-                rewards = rewards / (std + 1e-6)
+                # Fallback for fixed group sizes
+                if rewards.shape[-1] == self.args.n_samples_per_prompt * self.args.rollout_batch_size:
+                    rewards = rewards.reshape(-1, self.args.n_samples_per_prompt)
+                else:
+                    rewards = rewards.view(-1, rewards.shape[-1])
+                mean = rewards.mean(dim=-1, keepdim=True)
+                rewards = rewards - mean
+                if self.args.advantage_estimator in ["grpo", "gspo"] and self.args.grpo_std_normalization:
+                    std = rewards.std(dim=-1, keepdim=True)
+                    rewards = rewards / (std + 1e-6)
 
             return raw_rewards, rewards.flatten().tolist()
 
         return raw_rewards, raw_rewards
 
-    def _convert_samples_to_train_data(self, samples: Union[list[Sample], list[list[Sample]]]):
+    def _convert_samples_to_train_data(
+        self, samples: Union[list[Sample], list[list[Sample]]], group_sizes: Optional[list[int]]
+    ):
         """
         Convert inference generated samples to training data.
         """
@@ -249,6 +261,8 @@ class RolloutManager:
             "truncated": [1 if sample.status == Sample.Status.TRUNCATED else 0 for sample in samples],
             "sample_indices": [sample.index for sample in samples],
         }
+        if group_sizes:
+            train_data["group_sizes"] = group_sizes
 
         # loss mask
         # TODO: compress the loss mask
@@ -413,6 +427,7 @@ def _start_router(args):
 
     else:
         from sglang_router.launch_router import RouterArgs
+
         from slime.utils.http_utils import run_router
 
         args.sglang_router_ip = get_host_info()[1]
