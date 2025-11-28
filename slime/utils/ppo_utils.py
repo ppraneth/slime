@@ -47,6 +47,74 @@ def compute_approx_kl(
 
 
 @torch.compile(dynamic=True)
+def compute_policy_loss_sapo(
+    ppo_kl: torch.Tensor,
+    advantages: torch.Tensor,
+    tau_pos: float,
+    tau_neg: float,
+):
+    """
+    Soft Adaptive Policy Optimization (SAPO) Loss.
+
+    SAPO replaces hard clipping with smooth, temperature-controlled gating:
+        f(r) = (4/τ) * σ(τ(r - 1))
+
+    where:
+        - r = π_θ / π_θ_old (importance ratio)
+        - σ is the sigmoid function
+        - τ controls the rate of attenuation (larger = faster decay)
+
+    Key properties:
+        1. On-policy preservation: At r=1, gradient weight = 1 (regardless of τ)
+        2. Smooth trust region: Gradients decay continuously as r deviates from 1
+        3. Asymmetric control: τ_neg > τ_pos for stability (negative tokens decay faster)
+
+    The gradient weight is:
+        w(r) = 4 * σ(τ(r-1)) * (1 - σ(τ(r-1)))
+
+    which peaks at r=1 with value 1.0 and decays smoothly.
+
+    Args:
+        ppo_kl: Token-level KL divergence (old_log_probs - log_probs)
+        advantages: Token-level advantages
+        tau_pos: Temperature for positive advantages (default: 1.0)
+        tau_neg: Temperature for negative advantages (default: 1.05, should be >= tau_pos)
+
+    Returns:
+        pg_losses: Policy gradient loss per token
+        clipfrac: Fraction of tokens with low gate weight (< 0.5), indicating off-policy behavior
+
+    Reference:
+        "Soft Adaptive Policy Optimization" (arXiv:2511.20347)
+    """
+    # Compute importance ratio: r = exp(-kl) = π_θ / π_θ_old
+    ratio = (-ppo_kl).exp()
+
+    # Select temperature based on advantage sign
+    # Negative advantages use higher temperature for faster decay (stability)
+    tau = torch.where(advantages > 0, tau_pos, tau_neg)
+
+    # Compute sigmoid value: σ(τ(r - 1))
+    sigmoid_val = torch.sigmoid(tau * (ratio - 1.0))
+
+    # Compute soft gating function: f(r) = (4/τ) * σ(τ(r - 1))
+    f_ratio = (4.0 / tau) * sigmoid_val
+
+    # Policy loss: maximize f(r) * A, so loss is negative
+    pg_losses = -f_ratio * advantages
+
+    # Compute gate weight for monitoring: w(θ) = 4 * σ * (1 - σ)
+    # This peaks at r=1 with value 1.0 and decays as r deviates
+    gate_weight = 4.0 * sigmoid_val * (1.0 - sigmoid_val)
+
+    # "Clipfrac" represents tokens with low gate weight (< 0.5)
+    # indicating significant deviation from on-policy behavior
+    clipfrac = (gate_weight < 0.5).float()
+
+    return pg_losses, clipfrac
+
+
+@torch.compile(dynamic=True)
 def compute_policy_loss(
     ppo_kl: torch.Tensor,
     advantages: torch.Tensor,

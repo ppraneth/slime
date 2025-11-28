@@ -654,6 +654,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help="lower bound of the value for Dual-clip PPO from https://arxiv.org/pdf/1912.09729",
             )
+            parser.add_argument(
+                "--sapo-tau-pos",
+                type=float,
+                default=1.0,
+                help="Temperature for positive advantages in SAPO (Soft Adaptive Policy Optimization)",
+            )
+            parser.add_argument(
+                "--sapo-tau-neg",
+                type=float,
+                default=1.05,
+                help="Temperature for negative advantages in SAPO. Usually set > sapo-tau-pos to dampen instability.",
+            )
             parser.add_argument("--value-clip", type=float, default=0.2, help="the clip for value loss")
             parser.add_argument(
                 "--kl-coef",
@@ -693,6 +705,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 choices=[
                     "grpo",
                     "gspo",
+                    "sapo",
                     "reinforce_plus_plus",
                     "reinforce_plus_plus_baseline",
                     "ppo",
