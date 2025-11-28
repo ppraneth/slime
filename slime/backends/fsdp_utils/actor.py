@@ -816,37 +816,15 @@ def get_logprob_and_entropy_with_cp(
         log_probs: Aggregated log probabilities with shape [total_seq_len - 1]
         entropy: Aggregated entropy with shape [total_seq_len - 1]
     """
-
-    # Helper: Compute entropy in chunks to prevent OutOfMemoryError.
-    # The original implementation materialized full probabilities and log_probabilities
-    # for the entire sequence at once (size [Seq_Len, Vocab_Size]), which caused OOM.
-    # This helper processes the logits in small chunks to keep peak memory usage low.
-    def compute_entropy_chunked(logits_in, chunk_size=1024):
-        # Pre-allocate output tensor
-        ent_out = torch.empty(logits_in.size(0), dtype=logits_in.dtype, device=logits_in.device)
-
-        # Iterate in chunks
-        for i in range(0, logits_in.size(0), chunk_size):
-            chunk = logits_in[i : i + chunk_size]
-            # Compute softmax/log_softmax only for this small chunk
-            l_p = torch.log_softmax(chunk, dim=-1)
-            p = torch.exp(l_p)
-            ent_out[i : i + chunk_size] = -(p * l_p).sum(dim=-1)
-        return ent_out
-
     # Fast path for non-CP mode (cp_size=1): avoid unnecessary communication
     if cp_size == 1:
         shifted_logits = logits[:-1, :]
         local_log_probs = gather_log_probs_packed(
             shifted_logits, target_tokens, allow_compile=allow_compile, temperature=temperature
         )
-
-        # log_probs_full = torch.log_softmax(shifted_logits, dim=-1)
-        # probs = torch.softmax(shifted_logits, dim=-1)
-        # entropy = -(probs * log_probs_full).sum(dim=-1)
-
-        entropy = compute_entropy_chunked(shifted_logits)
-
+        log_probs_full = torch.log_softmax(shifted_logits, dim=-1)
+        probs = torch.softmax(shifted_logits, dim=-1)
+        entropy = -(probs * log_probs_full).sum(dim=-1)
         return local_log_probs, entropy
 
     chunk_size = logits.shape[0]
@@ -874,12 +852,9 @@ def get_logprob_and_entropy_with_cp(
 
     # Compute entropy
     shifted_logits = logits[:-1, :] if cp_rank == cp_size - 1 else logits
-
-    # log_probs_full = torch.log_softmax(shifted_logits, dim=-1)
-    # probs = torch.softmax(shifted_logits, dim=-1)
-    # entropy = -(probs * log_probs_full).sum(dim=-1)
-
-    entropy = compute_entropy_chunked(shifted_logits)
+    log_probs_full = torch.log_softmax(shifted_logits, dim=-1)
+    probs = torch.softmax(shifted_logits, dim=-1)
+    entropy = -(probs * log_probs_full).sum(dim=-1)
 
     # Pad entropy for the last rank
     if cp_rank == cp_size - 1:
